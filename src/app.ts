@@ -1,46 +1,46 @@
-// main.ts
 import mqtt from "mqtt";
-import { MovingAverageFilter, KalmanFilter1D } from "./filters";
-import { PositionFilter } from "./outlier";
-import { trilaterate, Point } from "./trilateration";
-import { rssiToDistance } from "./pathLoss";
+import fs from "fs";
+import path from "path";
 
-// ----- Configuration -----
-// Filter switches and parameters
-const USE_MOVING_AVERAGE = true;
-const USE_KALMAN = true;
-const MA_WINDOW_SIZE = 5;
-const KALMAN_R = 0.5;
-const KALMAN_Q = 0.2;
-
-// Outlier rejection settings
-const POSITION_HISTORY_LENGTH = 5;
-const OUTLIER_THRESHOLD = 1.0; // in meters
-
-// MQTT settings
+// MQTT Setup
 const brokerUrl = "mqtt://security.local";
+const client = mqtt.connect(brokerUrl);
 
-// ----- Data Structures -----
-// For each beacon (identified by its MAC), maintain per-anchor filters.
-interface BeaconFilters {
-  [anchorId: number]: {
-    maFilter?: MovingAverageFilter;
-    kalmanFilter?: KalmanFilter1D;
-  };
-}
-const beaconFilters: Map<string, BeaconFilters> = new Map();
+// Configuration
+const SMOOTHING_FACTOR = 0.3; // 0.1-0.5 (lower = smoother)
+const MIN_ANCHORS = 4; // Minimum anchors required for positioning
+const TARGET_MAC = "5b:76:29:38:17:6f"; // Filter for specific beacon
+const POSITION_FILE = "saved_position.json";
+const MOVEMENT_THRESHOLD = 2.0; // meters - distance threshold to consider movement significant
 
-// Latest computed distance per beacon per anchor
-interface BeaconDistances {
+// Anchor positions (in meters)
+const anchorPositions: { [id: number]: { x: number; y: number } } = {
+  1: { x: 0, y: 0 },
+  2: { x: 4, y: 0 },
+  3: { x: 0, y: 4 },
+  4: { x: 4, y: 4 },
+};
+
+// Data structures
+interface AnchorRSSI {
   [anchorId: number]: number;
 }
-const latestDistances: Map<string, BeaconDistances> = new Map();
+const beaconRSSI: { [mac: string]: AnchorRSSI } = {};
+const smoothedPositions: { [mac: string]: { x: number; y: number } } = {};
 
-// Position filtering per beacon (for outlier rejection)
-const beaconPositionFilter: Map<string, PositionFilter> = new Map();
+// Load saved position
+let savedPosition: { x: number; y: number } | null = null;
+try {
+  if (fs.existsSync(POSITION_FILE)) {
+    const data = fs.readFileSync(POSITION_FILE, 'utf8');
+    savedPosition = JSON.parse(data);
+    console.log(`Loaded saved position: ${JSON.stringify(savedPosition)}`);
+  }
+} catch (err) {
+  console.error("Error loading saved position:", err);
+}
 
-// ----- MQTT Client Setup -----
-const client = mqtt.connect(brokerUrl);
+// MQTT Connection
 client.on("connect", () => {
   console.log("Connected to MQTT broker");
   client.subscribe("esp32_1/rssi");
@@ -49,79 +49,96 @@ client.on("connect", () => {
   client.subscribe("esp32_4/rssi");
 });
 
-// ----- MQTT Message Handler -----
+// Message Handler
 client.on("message", (topic, message) => {
   try {
     const data = JSON.parse(message.toString());
-    // Expected JSON format:
-    // { "mac": "AA:BB:CC:DD:EE:FF", "rssi": -65, "timestamp": 1620000000000, "major": 0, "minor": 0, "esp": 2 }
-    const { mac, rssi, esp, timestamp } = data;
-    const beaconId = mac; // Unique beacon identifier
-    const anchorId: number = esp;
+    const { mac, rssi, esp } = data;
 
-    if (beaconId === "5B:76:29:38:17:6F".toLowerCase()) return;
+    // Filter for target beacon
+    if (mac !== TARGET_MAC) return;
 
-    // Initialize filters and position filter per beacon if needed
-    if (!beaconFilters.has(beaconId)) {
-      beaconFilters.set(beaconId, {});
-      beaconPositionFilter.set(beaconId, new PositionFilter(POSITION_HISTORY_LENGTH, OUTLIER_THRESHOLD));
-    }
-    const filters = beaconFilters.get(beaconId)!;
-    if (!filters[anchorId]) {
-      filters[anchorId] = {
-        maFilter: USE_MOVING_AVERAGE ? new MovingAverageFilter(MA_WINDOW_SIZE) : undefined,
-        kalmanFilter: USE_KALMAN ? new KalmanFilter1D(KALMAN_R, KALMAN_Q) : undefined,
-      };
-    }
-    let currentValue = rssi;
-    const rawRssi = rssi;
-    let movingAvg: number = currentValue;
-    let kalmanFiltered: number = currentValue;
+    // Store raw RSSI
+    if (!beaconRSSI[mac]) beaconRSSI[mac] = {};
+    beaconRSSI[mac][esp] = rssi;
 
-    if (USE_MOVING_AVERAGE && filters[anchorId].maFilter) {
-      movingAvg = filters[anchorId].maFilter.update(currentValue);
-      currentValue = movingAvg;
-    }
-    if (USE_KALMAN && filters[anchorId].kalmanFilter) {
-      kalmanFiltered = filters[anchorId].kalmanFilter.update(currentValue);
-      currentValue = kalmanFiltered;
-    }
-
-    // Convert the filtered RSSI value to an estimated distance.
-    const distance = rssiToDistance(currentValue);
-
-    // Diagnostics log for this update
-    console.log(JSON.stringify({
-      beacon: beaconId,
-      anchor: anchorId,
-      timestamp: timestamp,
-      rawRssi: rawRssi,
-      movingAverageRssi: USE_MOVING_AVERAGE ? movingAvg : undefined,
-      kalmanFilteredRssi: USE_KALMAN ? kalmanFiltered : undefined,
-      computedDistance: distance
-    }));
-
-    // Update the latest distances for this beacon
-    if (!latestDistances.has(beaconId)) {
-      latestDistances.set(beaconId, {});
-    }
-    const distances = latestDistances.get(beaconId)!;
-    distances[anchorId] = distance;
-
-    // If we have received distances from at least three anchors, run trilateration.
-    if (Object.keys(distances).length >= 3) {
-      const pos: Point | null = trilaterate(distances);
-      if (pos) {
-        // Use outlier rejection to reject spurious positions.
-        const posFilter = beaconPositionFilter.get(beaconId)!;
-        if (posFilter.checkAndUpdate(pos.x, pos.y)) {
-          console.log(`Beacon ${beaconId} estimated position: x=${pos.x.toFixed(2)}, y=${pos.y.toFixed(2)}`);
+    // Estimate position only when enough anchors are available
+    if (Object.keys(beaconRSSI[mac]).length >= MIN_ANCHORS) {
+      const newPos = estimatePosition(beaconRSSI[mac]);
+      
+      if (newPos) {
+        // Apply exponential smoothing to position
+        if (!smoothedPositions[mac]) {
+          smoothedPositions[mac] = newPos;
         } else {
-          console.warn(`Outlier position for beacon ${beaconId} rejected: x=${pos.x.toFixed(2)}, y=${pos.y.toFixed(2)}`);
+          smoothedPositions[mac].x = SMOOTHING_FACTOR * newPos.x + (1 - SMOOTHING_FACTOR) * smoothedPositions[mac].x;
+          smoothedPositions[mac].y = SMOOTHING_FACTOR * newPos.y + (1 - SMOOTHING_FACTOR) * smoothedPositions[mac].y;
+        }
+
+        const currentPos = smoothedPositions[mac];
+        console.log(
+          `Beacon ${mac} at (x: ${currentPos.x.toFixed(2)}, y: ${currentPos.y.toFixed(2)})`
+        );
+
+        // Check distance from saved position
+        if (savedPosition) {
+          const distance = calculateDistance(currentPos, savedPosition);
+          if (distance > MOVEMENT_THRESHOLD) {
+            console.log(`⚠️ Device moved ${distance.toFixed(2)}m from saved position!`);
+          }
         }
       }
     }
-  } catch (err) {
-    console.error("Error processing MQTT message:", err);
+  } catch (error) {
+    console.error("MQTT message error:", error);
   }
 });
+
+// Calculate distance between two points
+function calculateDistance(pos1: { x: number; y: number }, pos2: { x: number; y: number }): number {
+  const dx = pos1.x - pos2.x;
+  const dy = pos1.y - pos2.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Save position to file
+function savePosition(position: { x: number; y: number }): void {
+  try {
+    fs.writeFileSync(POSITION_FILE, JSON.stringify(position));
+    savedPosition = position;
+    console.log(`Position saved: ${JSON.stringify(position)}`);
+  } catch (err) {
+    console.error("Error saving position:", err);
+  }
+}
+
+// Optimized Position Estimation (Small-room variant)
+function estimatePosition(rssiMap: AnchorRSSI): { x: number; y: number } | null {
+  let totalWeight = 0;
+  let weightedX = 0;
+  let weightedY = 0;
+
+  for (const [anchorIdStr, rssi] of Object.entries(rssiMap)) {
+    const anchorId = Number(anchorIdStr);
+    const pos = anchorPositions[anchorId];
+    if (!pos) continue;
+
+    // Aggressive weighting for small rooms (weak signals matter less)
+    const weight = Math.pow(10, rssi / 20); // Note: 20 instead of 10
+    totalWeight += weight;
+    weightedX += pos.x * weight;
+    weightedY += pos.y * weight;
+  }
+
+  return totalWeight > 0 ? { x: weightedX / totalWeight, y: weightedY / totalWeight } : null;
+}
+
+// Add command to save current position (for example via console input)
+process.stdin.on('data', (data) => {
+  const input = data.toString().trim();
+  if (input === 'save' && smoothedPositions[TARGET_MAC]) {
+    savePosition(smoothedPositions[TARGET_MAC]);
+  }
+});
+
+console.log("Type 'save' to save the current position");
