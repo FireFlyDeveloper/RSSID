@@ -1,6 +1,5 @@
 import mqtt from "mqtt";
 import fs from "fs";
-import path from "path";
 
 // MQTT Setup
 const brokerUrl = "mqtt://security.local";
